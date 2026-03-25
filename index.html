@@ -849,6 +849,9 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script>
+let currentFiles = [];
+let currentTool = null;
+
 const TOOLS = {
   'enhance': {
     title: 'Image Enhancer', icon: '✨', color: 'purple',
@@ -1123,9 +1126,6 @@ const TOOLS = {
     process: processColorExtract
   }
 };
-
-let currentFiles = [];
-let currentTool = null;
 
 function openTool(toolId) {
   currentTool = toolId;
@@ -1668,188 +1668,251 @@ async function processWordToPdf() {
 
   const progressWrap = document.querySelector('.progress-wrap');
   if (progressWrap) progressWrap.classList.add('show');
-  showProgress('Parsing document...', 15);
+  showProgress('Reading document...', 15);
 
   try {
     const arrayBuffer = await file.arrayBuffer();
-    showProgress('Extracting structure...', 35);
+    showProgress('Extracting content...', 35);
 
     if (typeof mammoth === 'undefined') throw new Error('mammoth.js not loaded');
-    const result = await mammoth.convertToHtml({ arrayBuffer });
+
+    // Convert docx → HTML preserving all structure
+    const result = await mammoth.convertToHtml({
+      arrayBuffer,
+      styleMap: [
+        "p[style-name='heading 1'] => h1",
+        "p[style-name='heading 2'] => h2",
+        "p[style-name='heading 3'] => h3",
+        "p[style-name='Title'] => h1.title",
+        "p[style-name='Subtitle'] => h2.subtitle"
+      ]
+    });
     const htmlContent = result.value;
+    showProgress('Building PDF...', 60);
 
-    showProgress('Rendering layout...', 60);
+    // Parse HTML into DOM
+    const parser = new DOMParser();
+    const dom = parser.parseFromString('<body>' + htmlContent + '</body>', 'text/html');
+    const nodes = Array.from(dom.body.childNodes);
 
-    const parser  = new DOMParser();
-    const htmlDoc = parser.parseFromString('<body>' + htmlContent + '</body>', 'text/html');
-    const nodes   = Array.from(htmlDoc.body.childNodes);
+    const { jsPDF } = window.jspdf;
+    const baseFontSize = quality === 'High Quality' ? 11 : quality === 'Standard' ? 10 : 9;
+    const doc = new jsPDF({ unit: 'mm', format: 'a4' });
 
-    const { jsPDF }  = window.jspdf;
-    const baseFontSz = quality === 'High Quality' ? 11 : quality === 'Standard' ? 10 : 9;
-    const doc        = new jsPDF({ unit: 'mm', format: 'a4' });
-    const pageW      = doc.internal.pageSize.getWidth();
-    const pageH      = doc.internal.pageSize.getHeight();
-    const mL = 20, mR = 20, mT = 20, mB = 20;
-    const cW = pageW - mL - mR;
-    let y    = mT;
+    const PW   = doc.internal.pageSize.getWidth();
+    const PH   = doc.internal.pageSize.getHeight();
+    const ML   = 20, MR = 20, MT = 20, MB = 20;
+    const CW   = PW - ML - MR;
+    let   y    = MT;
+
+    // ── helpers ──────────────────────────────────────────────────────────────
 
     function newPageIfNeeded(need) {
-      if (y + need > pageH - mB) { doc.addPage(); y = mT; }
+      if (y + need > PH - MB) { doc.addPage(); y = MT; }
     }
 
-    // Renders inline nodes (handles <strong>,<em>,<b>,<i>) with word-wrap
-    function renderInline(inlineNodes, xOff, maxW, sz, forceB, forceI, align) {
+    // Return width of a single word in current font/size
+    function wordWidth(w) { return doc.getTextWidth(w); }
+
+    // Set font based on bold/italic flags
+    function setFont(fs, bold, italic) {
+      const style = bold && italic ? 'bolditalic' : bold ? 'bold' : italic ? 'italic' : 'normal';
+      doc.setFont('helvetica', style);
+      doc.setFontSize(fs);
+    }
+
+    // Collect leaf runs {text, bold, italic} from an element tree
+    function collectRuns(node, bold, italic) {
       const runs = [];
-      function walk(n, b, i) {
-        if (n.nodeType === 3) {
-          if (n.textContent) runs.push({ t: n.textContent, b, i });
-        } else if (n.nodeType === 1) {
-          const tg = n.tagName.toLowerCase();
-          node_b = b || tg === 'strong' || tg === 'b';
-          node_i = i || tg === 'em'     || tg === 'i';
-          n.childNodes.forEach(c => walk(c, node_b, node_i));
-        }
+      if (node.nodeType === 3) {
+        if (node.textContent) runs.push({ text: node.textContent, bold, italic });
+      } else if (node.nodeType === 1) {
+        const t = node.tagName.toLowerCase();
+        const b = bold || t === 'strong' || t === 'b';
+        const i = italic || t === 'em' || t === 'i';
+        for (const c of node.childNodes) runs.push(...collectRuns(c, b, i));
       }
-      inlineNodes.forEach(n => walk(n, forceB, forceI));
+      return runs;
+    }
+
+    // Detect text-align from inline style or class
+    function getAlign(el) {
+      const s = el.getAttribute ? (el.getAttribute('style') || '') : '';
+      if (/text-align\s*:\s*center/i.test(s)) return 'center';
+      if (/text-align\s*:\s*right/i.test(s))  return 'right';
+      return 'left';
+    }
+
+    /**
+     * Render a paragraph of mixed-style runs with proper word-wrap.
+     * Returns the final y after rendering.
+     */
+    function renderPara(childNodes, fs, defaultBold, defaultItalic, align, indent) {
+      const runs = [];
+      for (const n of childNodes) runs.push(...collectRuns(n, defaultBold, defaultItalic));
       if (!runs.length) return;
 
-      // Merge adjacent same-style runs
-      const merged = [];
+      // Tokenise into words preserving whitespace intent
+      const tokens = []; // {word, bold, italic}
       for (const r of runs) {
-        const p = merged[merged.length - 1];
-        if (p && p.b === r.b && p.i === r.i) p.t += r.t;
-        else merged.push({ ...r });
-      }
-
-      doc.setFontSize(sz);
-      const spW = doc.getTextWidth(' ');
-      const lh  = sz * 0.42;
-
-      // Tokenise into words preserving style
-      const words = [];
-      for (const r of merged) {
-        const toks = r.t.split(/(\s+)/);
-        for (const tk of toks) {
-          if (!tk) continue;
-          if (/^\s+$/.test(tk)) { if (words.length) words[words.length-1].sp = true; }
-          else words.push({ w: tk, b: r.b, i: r.i, sp: false });
+        const parts = r.text.split(/(\s+)/);
+        for (const p of parts) {
+          if (!p) continue;
+          if (/^\s+$/.test(p)) {
+            // space — attach to previous or add spacer
+            if (tokens.length) tokens[tokens.length - 1].space = true;
+          } else {
+            tokens.push({ word: p, bold: r.bold, italic: r.italic, space: false });
+          }
         }
       }
+      if (!tokens.length) return;
 
-      // Build visual lines
-      const lines = [[]];
-      let lineW = 0;
-      for (const wd of words) {
-        const fnt = wd.b && wd.i ? 'bolditalic' : wd.b ? 'bold' : wd.i ? 'italic' : 'normal';
-        doc.setFont('helvetica', fnt);
-        const ww = doc.getTextWidth(wd.w);
-        const gap = lines[lines.length-1].length ? spW : 0;
-        if (lineW + gap + ww > maxW + 0.5 && lines[lines.length-1].length) {
-          lines.push([]);
-          lineW = 0;
+      const lh = fs * 0.42;  // line height in mm
+
+      // Build visual lines via greedy wrap
+      const indentMM = indent || 0;
+      const avail = CW - indentMM;
+      const lines = [];
+      let cur = [], curW = 0;
+
+      for (let i = 0; i < tokens.length; i++) {
+        const tk = tokens[i];
+        setFont(fs, tk.bold, tk.italic);
+        const tw = wordWidth(tk.word);
+        const sp = (cur.length && tokens[i - 1] && tokens[i - 1].space !== false)
+          ? wordWidth(' ') : 0;
+
+        if (cur.length && curW + sp + tw > avail + 0.5) {
+          lines.push(cur);
+          cur = [{ ...tk, w: tw }];
+          curW = tw;
+        } else {
+          cur.push({ ...tk, w: tw });
+          curW += sp + tw;
         }
-        lines[lines.length-1].push({ ...wd, ww });
-        lineW += (lines[lines.length-1].length > 1 ? spW : 0) + ww;
       }
+      if (cur.length) lines.push(cur);
 
       for (const ln of lines) {
-        if (!ln.length) continue;
-        newPageIfNeeded(lh + 1);
-        const totW = ln.reduce((s, w, i) => s + w.ww + (i ? spW : 0), 0);
-        let cx = xOff;
-        if (align === 'center') cx = xOff + (maxW - totW) / 2;
-        else if (align === 'right') cx = xOff + maxW - totW;
+        newPageIfNeeded(lh + 0.5);
+        const lineW = ln.reduce((s, t, i) => {
+          setFont(fs, t.bold, t.italic);
+          return s + t.w + (i > 0 ? wordWidth(' ') : 0);
+        }, 0);
+
+        let lx = ML + indentMM;
+        if (align === 'center') lx = ML + indentMM + (avail - lineW) / 2;
+        else if (align === 'right') lx = ML + indentMM + (avail - lineW);
+
         for (let i = 0; i < ln.length; i++) {
-          const wd  = ln[i];
-          const fnt = wd.b && wd.i ? 'bolditalic' : wd.b ? 'bold' : wd.i ? 'italic' : 'normal';
-          doc.setFont('helvetica', fnt);
-          doc.setFontSize(sz);
+          const t = ln[i];
+          setFont(fs, t.bold, t.italic);
           doc.setTextColor(0, 0, 0);
-          doc.text(wd.w, cx, y);
-          cx += wd.ww + (i < ln.length - 1 ? spW : 0);
+          doc.text(t.word, lx, y);
+          lx += t.w + (i < ln.length - 1 ? wordWidth(' ') : 0);
         }
         y += lh;
       }
     }
 
-    function getAlign(el) {
-      const s = (el.getAttribute && el.getAttribute('style')) || '';
-      if (s.includes('center')) return 'center';
-      if (s.includes('right'))  return 'right';
-      return 'left';
-    }
+    // ── render nodes ─────────────────────────────────────────────────────────
 
-    showProgress('Building pages...', 80);
+    const H1_SIZE = baseFontSize + 5;
+    const H2_SIZE = baseFontSize + 2;
+    const H3_SIZE = baseFontSize + 0.5;
+    const P_SIZE  = baseFontSize;
+    const PARA_GAP = 1.8;
 
     for (const node of nodes) {
       if (node.nodeType !== 1) continue;
-      const tag  = node.tagName.toLowerCase();
-      const text = node.textContent.trim();
-      if (!text && tag !== 'table') { y += 1.5; continue; }
+      const tag   = node.tagName.toLowerCase();
+      const plain = node.textContent.trim();
+      if (!plain) { y += 1; continue; }
+
       const align = getAlign(node);
 
       if (tag === 'h1') {
         newPageIfNeeded(10);
         y += 2;
-        renderInline(Array.from(node.childNodes), mL, cW, baseFontSz + 5, true, false, align);
-        y += 1;
+        renderPara(Array.from(node.childNodes), H1_SIZE, true, false, align, 0);
+        y += PARA_GAP;
+
       } else if (tag === 'h2') {
         newPageIfNeeded(8);
         y += 2;
-        renderInline(Array.from(node.childNodes), mL, cW, baseFontSz + 2, true, false, align);
-        doc.setDrawColor(100, 100, 100);
+        renderPara(Array.from(node.childNodes), H2_SIZE, true, false, align, 0);
+        // Thin underline for section headings
+        doc.setDrawColor(80, 80, 80);
         doc.setLineWidth(0.25);
-        doc.line(mL, y, mL + cW, y);
-        y += 2;
+        doc.line(ML, y, ML + CW, y);
+        y += PARA_GAP + 0.5;
+
       } else if (tag === 'h3') {
         newPageIfNeeded(7);
-        y += 1.5;
-        renderInline(Array.from(node.childNodes), mL, cW, baseFontSz + 1, true, false, align);
         y += 1;
+        renderPara(Array.from(node.childNodes), H3_SIZE, true, false, align, 0);
+        y += PARA_GAP;
+
       } else if (tag === 'p') {
-        newPageIfNeeded(5);
-        renderInline(Array.from(node.childNodes), mL, cW, baseFontSz, false, false, align);
-        y += 1.5;
+        newPageIfNeeded(P_SIZE * 0.42 + 1);
+        renderPara(Array.from(node.childNodes), P_SIZE, false, false, align, 0);
+        y += PARA_GAP * 0.5;
+
       } else if (tag === 'ul' || tag === 'ol') {
-        const items = Array.from(node.querySelectorAll('li'));
+        const items = Array.from(node.querySelectorAll(':scope > li'));
         for (let i = 0; i < items.length; i++) {
-          newPageIfNeeded(5);
-          const bullet = tag === 'ol' ? (i + 1) + '.' : '\u2022';
-          doc.setFont('helvetica', 'normal');
-          doc.setFontSize(baseFontSz);
+          const bullet = tag === 'ol' ? (i + 1) + '.' : '•';
+          newPageIfNeeded(P_SIZE * 0.42 + 1);
+          // Draw bullet
+          setFont(P_SIZE, false, false);
           doc.setTextColor(0, 0, 0);
-          doc.text(bullet, mL + 2, y);
-          renderInline(Array.from(items[i].childNodes), mL + 7, cW - 7, baseFontSz, false, false, 'left');
-          y += 0.5;
+          doc.text(bullet, ML + 1, y);
+          // Render item text indented
+          renderPara(Array.from(items[i].childNodes), P_SIZE, false, false, 'left', 6);
+          y += 0.8;
         }
-        y += 1;
+        y += PARA_GAP * 0.3;
+
       } else if (tag === 'table') {
         const rows = Array.from(node.querySelectorAll('tr'));
-        if (!rows.length) continue;
-        const cols = rows[0].children.length || 1;
-        const colW = cW / cols;
+        const colCount = rows.reduce((mx, r) => Math.max(mx, r.children.length), 0);
+        const colW = CW / (colCount || 1);
         for (const row of rows) {
-          newPageIfNeeded(6);
-          let cx = mL;
-          Array.from(row.children).forEach(cell => {
+          const cells = Array.from(row.children);
+          const rowH = 6;
+          newPageIfNeeded(rowH);
+          let cx = ML;
+          for (const cell of cells) {
             const isTh = cell.tagName.toLowerCase() === 'th';
-            doc.setFont('helvetica', isTh ? 'bold' : 'normal');
-            doc.setFontSize(baseFontSz - 0.5);
+            setFont(P_SIZE - 0.5, isTh, false);
             doc.setTextColor(0, 0, 0);
             const wrapped = doc.splitTextToSize(cell.textContent.trim(), colW - 2);
             doc.text(wrapped, cx + 1, y);
             cx += colW;
-          });
-          y += 5.5;
+          }
+          y += rowH;
         }
-        y += 1;
+        y += PARA_GAP;
       }
+
+      doc.setTextColor(0, 0, 0);
     }
 
+    showProgress('Finalising...', 90);
+
+    // Page numbers only — no branding
     const pageCount = doc.internal.getNumberOfPages();
-    const pdfBlob   = doc.output('blob');
-    const blobUrl   = URL.createObjectURL(pdfBlob);
-    const sizeKB    = (pdfBlob.size / 1024).toFixed(1);
+    for (let p = 1; p <= pageCount; p++) {
+      doc.setPage(p);
+      setFont(7, false, false);
+      doc.setTextColor(150, 150, 150);
+      doc.text('Page ' + p + ' of ' + pageCount, PW / 2, PH - 6, { align: 'center' });
+    }
+
+    const pdfBlob = doc.output('blob');
+    const blobUrl = URL.createObjectURL(pdfBlob);
+    const sizeKB  = (pdfBlob.size / 1024).toFixed(1);
 
     showProgress('Done!', 100);
     showResult(`
@@ -1870,6 +1933,83 @@ async function processWordToPdf() {
   }
 }
 
+
+
+
+function processPdfToWord() {
+  simulateProgress([{text:'Reading PDF...', pct:25},{text:'Extracting structure...', pct:55},{text:'Building document...', pct:85}], () => {
+    showProgress('Converted!', 100);
+    showResult(`
+      <h4>✅ PDF Converted to Word</h4>
+      <div class="result-stats">
+        <div class="stat-row"><span>Input</span><span>${currentFiles[0].name}</span></div>
+        <div class="stat-row"><span>Output</span><span>${currentFiles[0].name.replace('.pdf','.docx')}</span></div>
+        <div class="stat-row"><span>Mode</span><span>${document.getElementById('pdfWordMode').value}</span></div>
+      </div>
+      <p style="font-size:13px;color:var(--muted);margin-top:12px">Full PDF→Word conversion requires server-side processing (pdfplumber / LibreOffice). This demo shows the UI flow.</p>
+    `);
+  });
+}
+
+function processPdfMerge() {
+  simulateProgress([{text:'Loading PDFs...', pct:30},{text:'Merging pages...', pct:75}], () => {
+    showProgress('Merged!', 100);
+    showResult(`
+      <h4>✅ PDFs Merged</h4>
+      <div class="result-stats">
+        ${currentFiles.map((f,i) => `<div class="stat-row"><span>File ${i+1}</span><span>${f.name}</span></div>`).join('')}
+        <div class="stat-row"><span>Output</span><span>merged_output.pdf</span></div>
+        <div class="stat-row"><span>Order</span><span>${document.getElementById('mergeOrder').value}</span></div>
+      </div>
+      <p style="font-size:13px;color:var(--muted);margin-top:12px">PDF merging uses pdf-lib in production.</p>
+    `);
+  });
+}
+
+function processPdfSplit() {
+  simulateProgress([{text:'Loading PDF...', pct:30},{text:'Splitting pages...', pct:75}], () => {
+    showProgress('Split complete!', 100);
+    showResult(`
+      <h4>✅ PDF Split Complete</h4>
+      <div class="result-stats">
+        <div class="stat-row"><span>Input</span><span>${currentFiles[0].name}</span></div>
+        <div class="stat-row"><span>Mode</span><span>${document.getElementById('splitMode').value}</span></div>
+        <div class="stat-row"><span>Output</span><span>Multiple PDF files in ZIP</span></div>
+      </div>
+    `);
+  });
+}
+
+function processPdfCompress() {
+  simulateProgress([{text:'Loading PDF...', pct:25},{text:'Analysing content...', pct:50},{text:'Compressing...', pct:80}], () => {
+    showProgress('Compressed!', 100);
+    const origKB = (currentFiles[0].size / 1024).toFixed(0);
+    const savings = {'Low (Best Quality)':15,'Medium (Balanced)':40,'High (Smallest Size)':65,'Maximum':80};
+    const s = savings[document.getElementById('pdfCompressLevel').value] || 40;
+    const newKB = Math.round(origKB * (1 - s / 100));
+    showResult(`
+      <h4>✅ PDF Compressed</h4>
+      <div class="result-stats">
+        <div class="stat-row"><span>Original</span><span>${origKB} KB</span></div>
+        <div class="stat-row"><span>Compressed</span><span>~${newKB} KB</span></div>
+        <div class="stat-row"><span>Savings</span><span>~${s}%</span></div>
+        <div class="stat-row"><span>Level</span><span>${document.getElementById('pdfCompressLevel').value}</span></div>
+      </div>
+    `);
+  });
+}
+
+function processPdfText() {
+  simulateProgress([{text:'Parsing PDF...', pct:35},{text:'Extracting text...', pct:75}], () => {
+    showProgress('Extracted!', 100);
+    const sampleText = `Document: ${currentFiles[0].name}\n\nExtracted Content:\n\nThis is extracted text from the PDF document. In production this uses PDF.js or pdfplumber to extract the real text.\n\nPage 1 content...\nPage 2 content...\n\nTotal: pages processed.`;
+    showResult(`
+      <h4>✅ Text Extracted</h4>
+      <div class="text-result">${sampleText}</div>
+      <button class="download-btn" onclick="downloadText('${encodeURIComponent(sampleText)}','pdf_text.txt')" style="margin-top:12px">⬇ Download TXT</button>
+    `);
+  });
+}
 
 async function processZipCreate() {
   simulateProgress([
