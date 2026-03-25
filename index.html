@@ -846,6 +846,8 @@
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script>
 const TOOLS = {
   'enhance': {
@@ -1659,19 +1661,89 @@ function processPdfToImg() {
   });
 }
 
-function processWordToPdf() {
-  simulateProgress([{text:'Parsing document...', pct:30},{text:'Rendering layout...', pct:65},{text:'Generating PDF...', pct:90}], () => {
-    showProgress('Converted!', 100);
+async function processWordToPdf() {
+  const file = currentFiles[0];
+  const quality = document.getElementById('wordPdfQuality').value;
+  const outName = file.name.replace(/\.docx?$/i, '.pdf');
+
+  const progressWrap = document.querySelector('.progress-wrap');
+  if (progressWrap) progressWrap.classList.add('show');
+  showProgress('Parsing document...', 20);
+
+  try {
+    const arrayBuffer = await file.arrayBuffer();
+    showProgress('Extracting text...', 50);
+
+    let extractedText = '';
+    if (typeof mammoth !== 'undefined') {
+      const result = await mammoth.extractRawText({ arrayBuffer });
+      extractedText = result.value;
+    } else {
+      extractedText = 'File: ' + file.name + '\n\n[mammoth.js unavailable — install from CDN]';
+    }
+
+    showProgress('Generating PDF...', 80);
+
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({ unit: 'mm', format: 'a4' });
+    const pageW = doc.internal.pageSize.getWidth();
+    const pageH = doc.internal.pageSize.getHeight();
+    const margin = 18;
+    const maxW = pageW - margin * 2;
+
+    // Header bar
+    doc.setFillColor(124, 92, 252);
+    doc.rect(0, 0, pageW, 14, 'F');
+    doc.setTextColor(255, 255, 255);
+    doc.setFontSize(9);
+    doc.setFont('helvetica', 'bold');
+    doc.text('FilesWork — Word to PDF', margin, 9);
+    doc.text(outName, pageW - margin, 9, { align: 'right' });
+
+    // Body
+    doc.setTextColor(30, 30, 30);
+    doc.setFont('helvetica', 'normal');
+    const fontSize = quality === 'High Quality' ? 11 : quality === 'Standard' ? 10 : 9;
+    doc.setFontSize(fontSize);
+    const lineHeight = fontSize * 0.45;
+
+    let y = 24;
+    const lines = doc.splitTextToSize(extractedText || 'Document: ' + file.name, maxW);
+    for (const line of lines) {
+      if (y + lineHeight > pageH - margin) { doc.addPage(); y = margin; }
+      doc.text(line, margin, y);
+      y += lineHeight;
+    }
+
+    // Footer page numbers
+    const pageCount = doc.internal.getNumberOfPages();
+    for (let i = 1; i <= pageCount; i++) {
+      doc.setPage(i);
+      doc.setFontSize(8);
+      doc.setTextColor(160, 160, 160);
+      doc.text('Page ' + i + ' of ' + pageCount, pageW / 2, pageH - 8, { align: 'center' });
+    }
+
+    const pdfBlob = doc.output('blob');
+    const blobUrl = URL.createObjectURL(pdfBlob);
+    const sizeKB = (pdfBlob.size / 1024).toFixed(1);
+
+    showProgress('Done!', 100);
     showResult(`
       <h4>✅ Conversion Complete</h4>
       <div class="result-stats">
-        <div class="stat-row"><span>Input</span><span>${currentFiles[0].name}</span></div>
-        <div class="stat-row"><span>Output</span><span>${currentFiles[0].name.replace(/\.docx?$/,'.pdf')}</span></div>
-        <div class="stat-row"><span>Quality</span><span>${document.getElementById('wordPdfQuality').value}</span></div>
+        <div class="stat-row"><span>Input</span><span>${file.name}</span></div>
+        <div class="stat-row"><span>Output</span><span>${outName}</span></div>
+        <div class="stat-row"><span>Quality</span><span>${quality}</span></div>
+        <div class="stat-row"><span>Pages</span><span>${pageCount}</span></div>
+        <div class="stat-row"><span>PDF Size</span><span>${sizeKB} KB</span></div>
       </div>
-      <p style="font-size:13px;color:var(--muted);margin-top:12px">Word→PDF conversion requires a backend service (LibreOffice or similar). This demo shows the UI flow.</p>
+      <button class="download-btn" onclick="downloadBlob('${blobUrl}','${outName}')">⬇ Download ${outName}</button>
     `);
-  });
+  } catch(err) {
+    showProgress('Error', 0);
+    showResult('<p style="color:var(--accent2)">❌ Conversion failed: ' + err.message + '</p>');
+  }
 }
 
 function processPdfToWord() {
@@ -2014,15 +2086,26 @@ function processColorExtract() {
 // ===== DOWNLOAD HELPERS =====
 function downloadDataUrl(url, name) {
   const a = document.createElement('a');
-  a.href = url; a.download = name; a.click();
+  a.href = url;
+  a.download = name;
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
 }
 function downloadBlob(url, name) {
   const a = document.createElement('a');
-  a.href = url; a.download = name; a.click();
+  a.href = url;
+  a.download = name;
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
 }
 function downloadText(encoded, name) {
   const text = decodeURIComponent(encoded);
-  const blob = new Blob([text], {type:'text/plain'});
+  const blob = new Blob([text], {type: 'text/plain'});
   const url = URL.createObjectURL(blob);
   downloadBlob(url, name);
 }
