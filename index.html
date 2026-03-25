@@ -1674,227 +1674,182 @@ async function processWordToPdf() {
     const arrayBuffer = await file.arrayBuffer();
     showProgress('Extracting structure...', 35);
 
-    // Use convertToHtml to preserve headings, bold, lists, alignment
-    let htmlContent = '';
-    if (typeof mammoth !== 'undefined') {
-      const result = await mammoth.convertToHtml({ arrayBuffer });
-      htmlContent = result.value;
-    } else {
-      throw new Error('mammoth.js not loaded');
-    }
+    if (typeof mammoth === 'undefined') throw new Error('mammoth.js not loaded');
+    const result = await mammoth.convertToHtml({ arrayBuffer });
+    const htmlContent = result.value;
 
     showProgress('Rendering layout...', 60);
 
-    // Parse the HTML into a temporary DOM element
-    const parser = new DOMParser();
+    const parser  = new DOMParser();
     const htmlDoc = parser.parseFromString('<body>' + htmlContent + '</body>', 'text/html');
-    const nodes = Array.from(htmlDoc.body.childNodes);
+    const nodes   = Array.from(htmlDoc.body.childNodes);
 
-    const { jsPDF } = window.jspdf;
-    const baseFontSize = quality === 'High Quality' ? 11 : quality === 'Standard' ? 10 : 9;
-    const doc = new jsPDF({ unit: 'mm', format: 'a4' });
+    const { jsPDF }  = window.jspdf;
+    const baseFontSz = quality === 'High Quality' ? 11 : quality === 'Standard' ? 10 : 9;
+    const doc        = new jsPDF({ unit: 'mm', format: 'a4' });
+    const pageW      = doc.internal.pageSize.getWidth();
+    const pageH      = doc.internal.pageSize.getHeight();
+    const mL = 20, mR = 20, mT = 20, mB = 20;
+    const cW = pageW - mL - mR;
+    let y    = mT;
 
-    const pageW  = doc.internal.pageSize.getWidth();
-    const pageH  = doc.internal.pageSize.getHeight();
-    const marginL = 18, marginR = 18, marginT = 18, marginB = 18;
-    const contentW = pageW - marginL - marginR;
-    let y = marginT;
-
-    // Helper: add new page if needed
-    function checkPage(needed) {
-      if (y + needed > pageH - marginB) {
-        doc.addPage();
-        y = marginT;
-      }
+    function newPageIfNeeded(need) {
+      if (y + need > pageH - mB) { doc.addPage(); y = mT; }
     }
 
-    // Helper: render a block of rich inline content (handles <strong>, <em>)
-    function renderInlineNodes(inlineNodes, x, startY, maxWidth, fontSize, defaultBold, defaultItalic, align) {
-      // Collect runs: { text, bold, italic }
+    // Renders inline nodes (handles <strong>,<em>,<b>,<i>) with word-wrap
+    function renderInline(inlineNodes, xOff, maxW, sz, forceB, forceI, align) {
       const runs = [];
-      function walk(node, bold, italic) {
-        if (node.nodeType === 3) {
-          const t = node.textContent;
-          if (t) runs.push({ text: t, bold, italic });
-        } else if (node.nodeType === 1) {
-          const tag = node.tagName.toLowerCase();
-          const nb = bold || tag === 'strong' || tag === 'b';
-          const ni = italic || tag === 'em' || tag === 'i';
-          node.childNodes.forEach(c => walk(c, nb, ni));
+      function walk(n, b, i) {
+        if (n.nodeType === 3) {
+          if (n.textContent) runs.push({ t: n.textContent, b, i });
+        } else if (n.nodeType === 1) {
+          const tg = n.tagName.toLowerCase();
+          node_b = b || tg === 'strong' || tg === 'b';
+          node_i = i || tg === 'em'     || tg === 'i';
+          n.childNodes.forEach(c => walk(c, node_b, node_i));
         }
       }
-      inlineNodes.forEach(n => walk(n, defaultBold, defaultItalic));
+      inlineNodes.forEach(n => walk(n, forceB, forceI));
+      if (!runs.length) return;
 
-      if (!runs.length) return startY;
-
-      // Merge consecutive runs with same style
+      // Merge adjacent same-style runs
       const merged = [];
       for (const r of runs) {
-        const prev = merged[merged.length - 1];
-        if (prev && prev.bold === r.bold && prev.italic === r.italic) prev.text += r.text;
+        const p = merged[merged.length - 1];
+        if (p && p.b === r.b && p.i === r.i) p.t += r.t;
         else merged.push({ ...r });
       }
 
-      // Word-wrap across runs
-      doc.setFontSize(fontSize);
-      const spaceW = doc.getTextWidth(' ');
-      const words = []; // { word, bold, italic }
+      doc.setFontSize(sz);
+      const spW = doc.getTextWidth(' ');
+      const lh  = sz * 0.42;
+
+      // Tokenise into words preserving style
+      const words = [];
       for (const r of merged) {
-        const parts = r.text.split(/(\s+)/);
-        for (const p of parts) {
-          if (/^\s+$/.test(p)) {
-            if (words.length) words[words.length - 1].trailing = p;
-          } else if (p) {
-            words.push({ word: p, bold: r.bold, italic: r.italic, trailing: ' ' });
-          }
+        const toks = r.t.split(/(\s+)/);
+        for (const tk of toks) {
+          if (!tk) continue;
+          if (/^\s+$/.test(tk)) { if (words.length) words[words.length-1].sp = true; }
+          else words.push({ w: tk, b: r.b, i: r.i, sp: false });
         }
       }
 
-      let cx = x, cy = startY;
-      const lineH = fontSize * 0.42;
-
-      // Build lines
-      const lineGroups = [];
-      let curLine = [];
-      let curW = 0;
-
-      for (const w of words) {
-        const fnt = w.bold && w.italic ? 'bolditalic' : w.bold ? 'bold' : w.italic ? 'italic' : 'normal';
+      // Build visual lines
+      const lines = [[]];
+      let lineW = 0;
+      for (const wd of words) {
+        const fnt = wd.b && wd.i ? 'bolditalic' : wd.b ? 'bold' : wd.i ? 'italic' : 'normal';
         doc.setFont('helvetica', fnt);
-        doc.setFontSize(fontSize);
-        const ww = doc.getTextWidth(w.word);
-        const gap = curLine.length ? spaceW : 0;
-        if (curW + gap + ww > maxWidth + 0.5 && curLine.length) {
-          lineGroups.push(curLine);
-          curLine = [{ ...w, width: ww }];
-          curW = ww;
-        } else {
-          curLine.push({ ...w, width: ww });
-          curW += gap + ww;
+        const ww = doc.getTextWidth(wd.w);
+        const gap = lines[lines.length-1].length ? spW : 0;
+        if (lineW + gap + ww > maxW + 0.5 && lines[lines.length-1].length) {
+          lines.push([]);
+          lineW = 0;
         }
+        lines[lines.length-1].push({ ...wd, ww });
+        lineW += (lines[lines.length-1].length > 1 ? spW : 0) + ww;
       }
-      if (curLine.length) lineGroups.push(curLine);
 
-      for (const lg of lineGroups) {
-        checkPage(lineH + 1);
-        let lx = x;
-        const totalW = lg.reduce((s, w, i) => s + w.width + (i > 0 ? spaceW : 0), 0);
-        if (align === 'center') lx = x + (maxWidth - totalW) / 2;
-        else if (align === 'right') lx = x + maxWidth - totalW;
-
-        for (let i = 0; i < lg.length; i++) {
-          const w = lg[i];
-          const fnt = w.bold && w.italic ? 'bolditalic' : w.bold ? 'bold' : w.italic ? 'italic' : 'normal';
+      for (const ln of lines) {
+        if (!ln.length) continue;
+        newPageIfNeeded(lh + 1);
+        const totW = ln.reduce((s, w, i) => s + w.ww + (i ? spW : 0), 0);
+        let cx = xOff;
+        if (align === 'center') cx = xOff + (maxW - totW) / 2;
+        else if (align === 'right') cx = xOff + maxW - totW;
+        for (let i = 0; i < ln.length; i++) {
+          const wd  = ln[i];
+          const fnt = wd.b && wd.i ? 'bolditalic' : wd.b ? 'bold' : wd.i ? 'italic' : 'normal';
           doc.setFont('helvetica', fnt);
-          doc.setFontSize(fontSize);
-          doc.text(w.word, lx, y);
-          lx += w.width + (i < lg.length - 1 ? spaceW : 0);
+          doc.setFontSize(sz);
+          doc.setTextColor(0, 0, 0);
+          doc.text(wd.w, cx, y);
+          cx += wd.ww + (i < ln.length - 1 ? spW : 0);
         }
-        y += lineH;
+        y += lh;
       }
-
-      return y;
     }
 
-    // Detect if a paragraph is centre-aligned (mammoth adds style or class)
-    function isCentered(el) {
-      const style = (el.getAttribute && el.getAttribute('style')) || '';
-      const cls   = (el.getAttribute && el.getAttribute('class')) || '';
-      return style.includes('text-align: center') || style.includes('text-align:center') ||
-             cls.includes('center') || style.includes('center');
-    }
-    function isRight(el) {
-      const style = (el.getAttribute && el.getAttribute('style')) || '';
-      return style.includes('text-align: right') || style.includes('text-align:right');
+    function getAlign(el) {
+      const s = (el.getAttribute && el.getAttribute('style')) || '';
+      if (s.includes('center')) return 'center';
+      if (s.includes('right'))  return 'right';
+      return 'left';
     }
 
     showProgress('Building pages...', 80);
 
-    // Render each top-level node
     for (const node of nodes) {
       if (node.nodeType !== 1) continue;
-      const tag = node.tagName.toLowerCase();
+      const tag  = node.tagName.toLowerCase();
       const text = node.textContent.trim();
-      if (!text) { y += 2; continue; }
-
-      const align = isCentered(node) ? 'center' : isRight(node) ? 'right' : 'left';
+      if (!text && tag !== 'table') { y += 1.5; continue; }
+      const align = getAlign(node);
 
       if (tag === 'h1') {
-        checkPage(12);
-        y += 3;
-        doc.setDrawColor(124, 92, 252);
-        doc.setFillColor(124, 92, 252);
-        renderInlineNodes(Array.from(node.childNodes), marginL, y, contentW, baseFontSize + 6, true, false, align);
-        doc.setLineWidth(0.4);
-        doc.line(marginL, y + 1, marginL + contentW, y + 1);
-        y += 3;
-      } else if (tag === 'h2') {
-        checkPage(10);
+        newPageIfNeeded(10);
         y += 2;
-        renderInlineNodes(Array.from(node.childNodes), marginL, y, contentW, baseFontSize + 3, true, false, align);
-        doc.setDrawColor(200, 200, 220);
-        doc.setLineWidth(0.3);
-        doc.line(marginL, y + 1, marginL + contentW, y + 1);
+        renderInline(Array.from(node.childNodes), mL, cW, baseFontSz + 5, true, false, align);
+        y += 1;
+      } else if (tag === 'h2') {
+        newPageIfNeeded(8);
+        y += 2;
+        renderInline(Array.from(node.childNodes), mL, cW, baseFontSz + 2, true, false, align);
+        doc.setDrawColor(100, 100, 100);
+        doc.setLineWidth(0.25);
+        doc.line(mL, y, mL + cW, y);
         y += 2;
       } else if (tag === 'h3') {
-        checkPage(8);
-        y += 1;
-        renderInlineNodes(Array.from(node.childNodes), marginL, y, contentW, baseFontSize + 1, true, false, align);
+        newPageIfNeeded(7);
+        y += 1.5;
+        renderInline(Array.from(node.childNodes), mL, cW, baseFontSz + 1, true, false, align);
         y += 1;
       } else if (tag === 'p') {
-        checkPage(6);
-        y += 0.5;
-        renderInlineNodes(Array.from(node.childNodes), marginL, y, contentW, baseFontSize, false, false, align);
+        newPageIfNeeded(5);
+        renderInline(Array.from(node.childNodes), mL, cW, baseFontSz, false, false, align);
         y += 1.5;
       } else if (tag === 'ul' || tag === 'ol') {
         const items = Array.from(node.querySelectorAll('li'));
         for (let i = 0; i < items.length; i++) {
-          checkPage(6);
-          const bullet = tag === 'ol' ? (i + 1) + '.' : '•';
+          newPageIfNeeded(5);
+          const bullet = tag === 'ol' ? (i + 1) + '.' : '\u2022';
           doc.setFont('helvetica', 'normal');
-          doc.setFontSize(baseFontSize);
-          doc.setTextColor(30, 30, 30);
-          doc.text(bullet, marginL + 1, y);
-          renderInlineNodes(Array.from(items[i].childNodes), marginL + 6, y, contentW - 6, baseFontSize, false, false, 'left');
-          y += 1;
+          doc.setFontSize(baseFontSz);
+          doc.setTextColor(0, 0, 0);
+          doc.text(bullet, mL + 2, y);
+          renderInline(Array.from(items[i].childNodes), mL + 7, cW - 7, baseFontSz, false, false, 'left');
+          y += 0.5;
         }
         y += 1;
       } else if (tag === 'table') {
-        // Simple table rendering
         const rows = Array.from(node.querySelectorAll('tr'));
-        const colW = contentW / (rows[0] ? rows[0].children.length || 1 : 1);
+        if (!rows.length) continue;
+        const cols = rows[0].children.length || 1;
+        const colW = cW / cols;
         for (const row of rows) {
-          const cells = Array.from(row.children);
-          checkPage(7);
-          let cx2 = marginL;
-          for (const cell of cells) {
-            doc.setFont('helvetica', cell.tagName.toLowerCase() === 'th' ? 'bold' : 'normal');
-            doc.setFontSize(baseFontSize - 1);
-            doc.setTextColor(30, 30, 30);
-            const cellLines = doc.splitTextToSize(cell.textContent.trim(), colW - 2);
-            doc.text(cellLines, cx2 + 1, y);
-            cx2 += colW;
-          }
-          y += 6;
+          newPageIfNeeded(6);
+          let cx = mL;
+          Array.from(row.children).forEach(cell => {
+            const isTh = cell.tagName.toLowerCase() === 'th';
+            doc.setFont('helvetica', isTh ? 'bold' : 'normal');
+            doc.setFontSize(baseFontSz - 0.5);
+            doc.setTextColor(0, 0, 0);
+            const wrapped = doc.splitTextToSize(cell.textContent.trim(), colW - 2);
+            doc.text(wrapped, cx + 1, y);
+            cx += colW;
+          });
+          y += 5.5;
         }
+        y += 1;
       }
-
-      doc.setTextColor(30, 30, 30);
     }
 
-    // Footer page numbers
     const pageCount = doc.internal.getNumberOfPages();
-    for (let i = 1; i <= pageCount; i++) {
-      doc.setPage(i);
-      doc.setFontSize(7);
-      doc.setTextColor(160, 160, 160);
-      doc.setFont('helvetica', 'normal');
-      doc.text('Page ' + i + ' of ' + pageCount, pageW / 2, pageH - 6, { align: 'center' });
-    }
-
-    const pdfBlob = doc.output('blob');
-    const blobUrl = URL.createObjectURL(pdfBlob);
-    const sizeKB  = (pdfBlob.size / 1024).toFixed(1);
+    const pdfBlob   = doc.output('blob');
+    const blobUrl   = URL.createObjectURL(pdfBlob);
+    const sizeKB    = (pdfBlob.size / 1024).toFixed(1);
 
     showProgress('Done!', 100);
     showResult(`
@@ -1915,82 +1870,6 @@ async function processWordToPdf() {
   }
 }
 
-function processPdfToWord() {
-  simulateProgress([{text:'Reading PDF...', pct:25},{text:'Extracting structure...', pct:55},{text:'Building document...', pct:85}], () => {
-    showProgress('Converted!', 100);
-    showResult(`
-      <h4>✅ PDF Converted to Word</h4>
-      <div class="result-stats">
-        <div class="stat-row"><span>Input</span><span>${currentFiles[0].name}</span></div>
-        <div class="stat-row"><span>Output</span><span>${currentFiles[0].name.replace('.pdf','.docx')}</span></div>
-        <div class="stat-row"><span>Mode</span><span>${document.getElementById('pdfWordMode').value}</span></div>
-      </div>
-      <p style="font-size:13px;color:var(--muted);margin-top:12px">Full PDF→Word conversion is handled via backend processing in production.</p>
-    `);
-  });
-}
-
-function processPdfMerge() {
-  simulateProgress([{text:'Loading PDFs...', pct:30},{text:'Merging pages...', pct:75}], () => {
-    showProgress('Merged!', 100);
-    showResult(`
-      <h4>✅ PDFs Merged</h4>
-      <div class="result-stats">
-        ${currentFiles.map((f,i) => `<div class="stat-row"><span>File ${i+1}</span><span>${f.name}</span></div>`).join('')}
-        <div class="stat-row"><span>Output</span><span>merged_output.pdf</span></div>
-      </div>
-    `);
-  });
-}
-
-function processPdfSplit() {
-  simulateProgress([{text:'Loading PDF...', pct:30},{text:'Splitting pages...', pct:75}], () => {
-    showProgress('Split complete!', 100);
-    showResult(`
-      <h4>✅ PDF Split Complete</h4>
-      <div class="result-stats">
-        <div class="stat-row"><span>Input</span><span>${currentFiles[0].name}</span></div>
-        <div class="stat-row"><span>Mode</span><span>${document.getElementById('splitMode').value}</span></div>
-        <div class="stat-row"><span>Output</span><span>Multiple PDF files in ZIP</span></div>
-      </div>
-    `);
-  });
-}
-
-function processPdfCompress() {
-  simulateProgress([{text:'Loading PDF...', pct:25},{text:'Analyzing content...', pct:50},{text:'Compressing...', pct:80}], () => {
-    showProgress('Compressed!', 100);
-    const origKB = (currentFiles[0].size/1024).toFixed(0);
-    const savings = {
-      'Low (Best Quality)': 15,
-      'Medium (Balanced)': 40,
-      'High (Smallest Size)': 65,
-      'Maximum': 80
-    };
-    const s = savings[document.getElementById('pdfCompressLevel').value] || 40;
-    const newKB = Math.round(origKB * (1 - s/100));
-    showResult(`
-      <h4>✅ PDF Compressed</h4>
-      <div class="result-stats">
-        <div class="stat-row"><span>Original</span><span>${origKB} KB</span></div>
-        <div class="stat-row"><span>Compressed</span><span>~${newKB} KB</span></div>
-        <div class="stat-row"><span>Savings</span><span>~${s}%</span></div>
-      </div>
-    `);
-  });
-}
-
-function processPdfText() {
-  simulateProgress([{text:'Parsing PDF...', pct:35},{text:'Extracting text...', pct:75}], () => {
-    showProgress('Extracted!', 100);
-    const sampleText = `Document: ${currentFiles[0].name}\n\nExtracted Content:\n\nThis is a sample extracted text from the PDF document. In production, this would contain the actual text content extracted using PDF.js or a similar PDF parsing library.\n\nPage 1 content would appear here...\nPage 2 content would appear here...\n\nTotal: 3 pages processed.`;
-    showResult(`
-      <h4>✅ Text Extracted</h4>
-      <div class="text-result">${sampleText}</div>
-      <button class="download-btn" onclick="downloadText('${encodeURIComponent(sampleText)}','pdf_text.txt')" style="margin-top:12px">⬇ Download TXT</button>
-    `);
-  });
-}
 
 async function processZipCreate() {
   simulateProgress([
